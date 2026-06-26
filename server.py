@@ -1,8 +1,12 @@
 import json
 import os
+import uuid
 
 from aiohttp import web
 
+
+MAX_TEXT_LENGTH = 2000
+MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024
 
 clients = {}
 
@@ -26,13 +30,50 @@ async def broadcast(message_type, exclude=None, **payload):
         await send_json(client, message_type, **payload)
 
 
+async def broadcast_user_list():
+    users = [
+        {
+            "id": info["id"],
+            "name": info["name"],
+            "profile_photo": info.get("profile_photo", ""),
+        }
+        for info in clients.values()
+    ]
+    await broadcast("users", users=users)
+
+
 def clean_name(name):
     name = str(name or "").strip()
     return name[:30] if name else "Usuario"
 
 
+def clean_text(text):
+    return str(text or "").strip()[:MAX_TEXT_LENGTH]
+
+
+def clean_attachment(data):
+    attachment = data.get("attachment") or {}
+    filename = str(attachment.get("filename") or "archivo").strip()[:120]
+    mime = str(attachment.get("mime") or "application/octet-stream").strip()[:120]
+    content = str(attachment.get("data") or "")
+    size = int(attachment.get("size") or 0)
+
+    if not content:
+        return None
+
+    if size > MAX_ATTACHMENT_BYTES:
+        return {"error": "El archivo es demasiado grande. Maximo: 2 MB."}
+
+    return {
+        "filename": filename,
+        "mime": mime,
+        "data": content,
+        "size": size,
+    }
+
+
 async def websocket_handler(request):
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(max_msg_size=MAX_ATTACHMENT_BYTES + 256 * 1024)
     can_prepare = ws.can_prepare(request)
 
     if not can_prepare.ok:
@@ -42,7 +83,11 @@ async def websocket_handler(request):
         )
 
     await ws.prepare(request)
-    clients[ws] = "Usuario"
+    clients[ws] = {
+        "id": str(uuid.uuid4()),
+        "name": "Usuario",
+        "profile_photo": "",
+    }
     print("Cliente conectado")
 
     try:
@@ -56,29 +101,55 @@ async def websocket_handler(request):
                 data = {"type": "chat", "text": message.data}
 
             message_type = data.get("type")
+            sender_info = clients.get(ws)
+
+            if not sender_info:
+                continue
 
             if message_type == "join":
-                name = clean_name(data.get("name"))
-                clients[ws] = name
+                sender_info["name"] = clean_name(data.get("name"))
+                sender_info["profile_photo"] = str(data.get("profile_photo") or "")
 
-                await send_json(ws, "system", text=f"Te conectaste como {name}.")
-                await broadcast("system", exclude=ws, text=f"{name} se unio al chat.")
-                print(f"{name} se unio al chat")
+                await send_json(
+                    ws,
+                    "system",
+                    text=f"Te conectaste como {sender_info['name']}.",
+                )
+                await broadcast(
+                    "system",
+                    exclude=ws,
+                    text=f"{sender_info['name']} se unio al chat.",
+                )
+                await broadcast_user_list()
+                print(f"{sender_info['name']} se unio al chat")
 
             elif message_type == "chat":
-                sender = clients.get(ws, "Usuario")
-                text = str(data.get("text", "")).strip()
+                text = clean_text(data.get("text"))
+                attachment = clean_attachment(data)
 
-                if not text:
+                if isinstance(attachment, dict) and attachment.get("error"):
+                    await send_json(ws, "system", text=attachment["error"])
                     continue
 
-                print(f"{sender}: {text}")
-                await broadcast("chat", exclude=ws, sender=sender, text=text)
+                if not text and not attachment:
+                    continue
+
+                print(f"{sender_info['name']}: {text or '[archivo]'}")
+                await broadcast(
+                    "chat",
+                    exclude=ws,
+                    sender_id=sender_info["id"],
+                    sender=sender_info["name"],
+                    profile_photo=sender_info.get("profile_photo", ""),
+                    text=text,
+                    attachment=attachment,
+                )
 
     finally:
-        name = clients.pop(ws, "Usuario")
-        await broadcast("system", text=f"{name} salio del chat.")
-        print(f"{name} desconectado")
+        info = clients.pop(ws, {"name": "Usuario"})
+        await broadcast("system", text=f"{info['name']} salio del chat.")
+        await broadcast_user_list()
+        print(f"{info['name']} desconectado")
 
     return ws
 
