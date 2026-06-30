@@ -44,7 +44,7 @@ async def broadcast_user_list():
 
 def clean_name(name):
     name = str(name or "").strip()
-    return name[:30] if name else "Usuario"
+    return name[:5] if name else "Usuario"
 
 
 def clean_text(text):
